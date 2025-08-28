@@ -39,19 +39,45 @@ device = torch.device("cuda", LOCAL_RANK)
 class HookState:
     def __init__(self):
         self.total_comm_time = 0.0  # 累计 all‐reduce 时间
+        self.total_cnt = 0
+        # self.events = []
+
+print_shape = True
+model_size_bytes = None
+
 def timing_comm_hook(state: HookState, bucket) -> Future[torch.Tensor]:
+
+    start_evt = torch.cuda.Event(enable_timing=True)
+    end_evt   = torch.cuda.Event(enable_timing=True)
+
     t0 = time.perf_counter()
     pg = dist.distributed_c10d._get_default_group()
     opts = dist.AllreduceOptions()
     opts.reduceOp = dist.ReduceOp.SUM
-    work = pg.allreduce([bucket.buffer()], opts)
-    fut = work.get_future()            # torch._C.Future
-    def _callback(fut):                # 这里入参也是一个 Future
-        res_list = fut.value()         # 拿到真正的 list[Tensor]
-        state.total_comm_time += time.perf_counter() - t0
-        return res_list[0]             # 返回第 0 个 Tensor
-    return fut.then(_callback)         # 返回 Future[Tensor]
 
+    global print_shape
+    if print_shape == True:
+        buf = bucket.buffer()
+        global model_size_bytes
+        model_size_bytes = buf.numel()*buf.element_size()
+        print(f"[hook] bucket buffer shape: {tuple(buf.shape)}, #size: {model_size_bytes} bytes")
+        print_shape = False
+
+    start_evt.record()
+
+
+    work = pg.allreduce([bucket.buffer()], opts)
+    work.wait()
+    
+    end_evt.record()
+    torch.cuda.synchronize()
+    elapsed_ms = start_evt.elapsed_time(end_evt)
+    state.total_comm_time += elapsed_ms * 1e-3
+    state.total_cnt += 1
+
+    fut = torch.futures.Future()
+    fut.set_result(bucket.buffer())
+    return fut
 # ----------------------------
 # 3. 准备数据集与 DataLoader
 #    用本地 parquet（plain_text）文件
@@ -155,7 +181,7 @@ def collate_fn(batch):
     return imgs, labels
 train_loader = DataLoader(
     train_ds,
-    batch_size=128,
+    batch_size=32,
     sampler=train_sampler,
     num_workers=4,
     pin_memory=True,
@@ -177,6 +203,18 @@ print(batch[0].shape)
 # 4. 构建模型、包成 DDP 并注册钩子
 # ----------------------------
 num_classes = 10
+
+# model = models.resnet18(pretrained=False)
+
+# model.conv1 = nn.Conv2d(3, 64,
+#                         kernel_size=3,
+#                         stride=1,
+#                         padding=1,
+#                         bias=False)
+# model.maxpool = nn.Identity()
+
+# in_feats = model.fc.in_features   # 512
+# model.fc = nn.Linear(in_feats, num_classes)
 
 model = models.vgg16(pretrained=False)
 
@@ -264,15 +302,21 @@ train_start = time.perf_counter()
 for epoch in range(num_epochs):
     train_sampler.set_epoch(epoch)
     val_sampler.set_epoch(epoch)
-
+    
+    epoch_start = time.perf_counter()
     tloss, tacc = train_one_epoch(train_loader)
     vloss, vacc = validate(val_loader)
     scheduler.step()
+    epoch_time = time.perf_counter() - epoch_start
+    num_imgs    = len(train_loader.dataset)
+    throughput  = num_imgs / epoch_time
 
     if RANK == 0:
         print(f"[Epoch {epoch+1}/{num_epochs}] "
               f"Train loss: {tloss:.4f}, acc: {tacc:.4f}  |  "
-              f"Val   loss: {vloss:.4f}, acc: {vacc:.4f}")
+              f"Val   loss: {vloss:.4f}, acc: {vacc:.4f}  |  "
+              f"Processed: {num_imgs} imgs, "
+              f"Throughput: {throughput:.2f} imgs/s")
         if vacc > best_acc:
             best_acc = vacc
             best_wts = copy.deepcopy(ddp_model.state_dict())
@@ -280,12 +324,29 @@ for epoch in range(num_epochs):
 train_end = time.perf_counter()
 
 if RANK == 0:
+    num_imgs    = len(train_loader.dataset)
     total_time = train_end - train_start
     comm_time  = hook_state.total_comm_time
+    comm_cnt = hook_state.total_cnt
+    iter_comm_time = comm_time/comm_cnt
+    algbw = model_size_bytes/iter_comm_time
+    busbw = 2*(WORLD_SIZE-1)/WORLD_SIZE * algbw
+    busbw_factor_to_100G = busbw * 8 / (100 * 1e9)
+    comm_time_100G = comm_time * busbw_factor_to_100G
+    comp_time = total_time - comm_time
+    train_time_100G = comp_time + comm_time_100G
+    train_time_100G_INC = comp_time + comm_time_100G * WORLD_SIZE/(2*(WORLD_SIZE-1))
+    INC_speedup = train_time_100G / train_time_100G_INC
     print("\n=== Training complete ===")
     print(f"Total training time: {total_time:.1f}s")
-    print(f"Total all‐reduce time: {comm_time:.1f}s  "
-          f"({comm_time/total_time*100:.2f}%)")
+    print(f"Total all‐reduce time: {comm_time:.1f}s ({iter_comm_time:.6f}s for each)"
+          f"({comm_time/total_time*100:.2f}%)"
+          f", algbw: {algbw * 1e-9} GB/s"
+          f", busbw: {busbw * 1e-9} GB/s"
+          )
+    print(f"Training time (100G): {train_time_100G}, w/ INC: {train_time_100G_INC}, speedup: {INC_speedup}")
+    print(f"Epoch time (100G): {train_time_100G/num_epochs}, w/ INC: {train_time_100G_INC/num_epochs}")
+    print(f"Training throughput (100G): {num_imgs/(train_time_100G/num_epochs)}, w/ INC: {num_imgs/(train_time_100G_INC/num_epochs)}")
     ddp_model.load_state_dict(best_wts)
     torch.save(ddp_model.module.state_dict(), "best_vgg16_ddp.pth")
 
